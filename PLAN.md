@@ -1,11 +1,20 @@
 # Plan — Serverless ComfyUI on RunPod with Network Volume (Qwen-Image 2512)
 
 Goal: stand up a RunPod Serverless endpoint that runs ComfyUI and generates
-images with **Qwen-Image 2512**, where all model weights live on a
-**Network Volume** (not baked into the Docker image).
+images with **Qwen-Image 2512** in **full bf16 precision**, where all model
+weights live on a **Network Volume** (not baked into the Docker image).
 
 The image stays small and boots fast; swapping models/LoRAs is a volume
 operation, not an image rebuild.
+
+**Target model (verified, 2026-01):**
+[`Qwen/Qwen-Image-2512`](https://huggingface.co/Qwen/Qwen-Image-2512),
+released 2025-12-31. This is the December 2025 refresh of the Qwen-Image
+text-to-image foundation model — same architecture, VAE and text encoder
+as the original August 2025 release, but retrained UNet weights focused
+on more realistic humans, finer natural detail, and better text rendering.
+We consume it via the ComfyUI-packaged repo
+[`Comfy-Org/Qwen-Image_ComfyUI`](https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI).
 
 ---
 
@@ -54,9 +63,11 @@ Key choices:
 
 ## 2. Network Volume layout
 
-Create a Network Volume sized for the Qwen-Image 2512 bundle + headroom for
-LoRAs and output. Qwen-Image fp8 ≈ 20 GB, fp16 ≈ 40 GB, text encoder ≈ 8 GB,
-VAE < 1 GB. **Start at 100 GB**; resize later if needed.
+Full bf16 stack totals ~57.8 GB on disk (40.9 + 16.6 + 0.25). With headroom
+for the Lightning LoRA, ComfyUI custom nodes, input/output buffering and
+future variants, **provision the Network Volume at 150 GB**. Resizing later
+is possible but the volume has to be the same datacenter as the endpoint,
+so over-provision rather than under.
 
 Mount path inside the worker: `/runpod-volume`.
 
@@ -65,22 +76,27 @@ Mount path inside the worker: `/runpod-volume`.
 └── ComfyUI/
     ├── models/
     │   ├── diffusion_models/
-    │   │   └── qwen_image_2512_fp8_e4m3fn.safetensors
+    │   │   └── qwen_image_2512_bf16.safetensors              # 40.9 GB
     │   ├── text_encoders/
-    │   │   └── qwen_2.5_vl_7b_fp8_scaled.safetensors
+    │   │   └── qwen_2.5_vl_7b.safetensors                    # 16.6 GB, bf16
     │   ├── vae/
-    │   │   └── qwen_image_vae.safetensors
+    │   │   └── qwen_image_vae.safetensors                    # 254 MB
     │   └── loras/
-    │       └── Qwen-Image-Lightning-8steps.safetensors   # optional
+    │       └── Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors  # optional
     ├── custom_nodes/
-    │   └── ComfyUI-Manager/                              # optional, nice to have
+    │   └── ComfyUI-Manager/                                  # optional
     ├── input/
     └── output/
 ```
 
-> Filenames are placeholders. Before going live, pin the exact file list from
-> `Comfy-Org/Qwen-Image_ComfyUI` on Hugging Face for the **2512** release and
-> record the SHA256 of each file in `models.lock` (see §6).
+All three core files come from the same repo:
+[`Comfy-Org/Qwen-Image_ComfyUI`](https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI)
+under `split_files/{diffusion_models,text_encoders,vae}/`.
+
+The Lightning LoRA comes from
+[`lightx2v/Qwen-Image-2512-Lightning`](https://huggingface.co/lightx2v/Qwen-Image-2512-Lightning)
+(Apache-2.0). **Must be the 2512-specific LoRA** — the older
+`lightx2v/Qwen-Image-Lightning` LoRA produces broken output on 2512 weights.
 
 ### How to populate the volume
 
@@ -115,7 +131,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git python3 python3-pip python3-venv ffmpeg libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# ComfyUI at a pinned commit that supports Qwen-Image 2512 natively
+# ComfyUI at a pinned commit that supports Qwen-Image 2512 natively.
+# The 2512 workflow template landed in Comfy-Org/workflow_templates around
+# 2025-12-31, so any ComfyUI build from January 2026 or newer works. Pin to
+# a specific commit SHA in CI — do not float on master.
 ARG COMFYUI_REF=master
 RUN git clone https://github.com/comfyanonymous/ComfyUI /opt/ComfyUI \
     && cd /opt/ComfyUI && git checkout ${COMFYUI_REF}
@@ -203,49 +222,98 @@ reinvent the websocket plumbing.
 
 ## 5. Qwen-Image 2512 workflow
 
-Ship a canonical text-to-image workflow at `workflows/qwen_image_2512_t2i.json`.
-It mirrors the reference workflow that Comfy-Org publishes for Qwen-Image:
+Take the canonical workflow directly from
+[`Comfy-Org/workflow_templates/templates/image_qwen_Image_2512.json`](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/image_qwen_Image_2512.json)
+and commit it unmodified at `workflows/qwen_image_2512_t2i.json`. Don't
+hand-roll it; the template is the upstream source of truth.
 
-Nodes:
-1. `UNETLoader` → `qwen_image_2512_fp8_e4m3fn.safetensors`, weight dtype
-   `fp8_e4m3fn`
-2. `CLIPLoader` → `qwen_2.5_vl_7b_fp8_scaled.safetensors`, type `qwen_image`
+Node graph (from the reference template, all stock ComfyUI nodes — the
+2512 drop introduced no new node types):
+
+1. `UNETLoader` → `qwen_image_2512_bf16.safetensors`, weight dtype `default`
+2. `CLIPLoader` → `qwen_2.5_vl_7b.safetensors`, type `qwen_image`
 3. `VAELoader` → `qwen_image_vae.safetensors`
-4. `ModelSamplingAuraFlow` (shift ≈ 3.1 — tune per release notes)
+4. `ModelSamplingAuraFlow` → **shift = 3.1** (tuned for 2512; original
+   Qwen-Image used ~3.0 — do not inherit shift from an old workflow)
 5. `CLIPTextEncode` × 2 (positive / negative)
-6. `EmptySD3LatentImage` (1328×1328 default for Qwen-Image)
-7. `KSampler` — sampler `euler`, scheduler `simple`, steps 20, cfg 2.5
-   (or steps 8, cfg 1.0 when the Lightning LoRA is stacked via `LoraLoader`)
+6. `EmptySD3LatentImage` → **1328 × 1328** (native 1:1 resolution)
+7. `KSampler` — sampler `euler`, scheduler `simple`
 8. `VAEDecode` → `SaveImage`
 
-Expose a "fast" variant that inserts `LoraLoader` with
-`Qwen-Image-Lightning-8steps` and drops `KSampler` to 8 steps — that's the
-difference between a ~30 s job and a ~10 s job on a 4090-class GPU.
+### Two workflow variants to ship
+
+| Variant | Steps | CFG | LoRA | Notes |
+|---------|-------|-----|------|-------|
+| **Quality** (default) | 50 | 4.0 | none | Upstream default from the 2512 template. |
+| **Turbo** | 4  | 1.0 | Lightning 4-step bf16 | Stack `LoraLoader` between `UNETLoader` and `ModelSamplingAuraFlow`, strength 1.0. |
+
+Keep `cfg = 4.0` for the quality variant unless output regresses — upstream
+guidance is that if text rendering deforms, drop CFG before swapping the
+sampler.
 
 The workflow JSON is what clients POST in `input.workflow`; they override
-prompt text, seed, and size via the node inputs. Keep a Python helper in
-`src/workflows.py` that loads the JSON and patches those fields so callers
-don't have to hand-edit node IDs.
+prompt text, seed, and size via node inputs. A small Python helper in
+`src/workflows.py` loads the JSON and patches those fields by node ID so
+callers don't have to know the graph shape. Two loader functions:
+`load_quality()` and `load_turbo()`.
 
 ---
 
 ## 6. Model provenance (`models.lock`)
 
-Commit a `models.lock` file listing every weight file we expect on the
-volume, with:
+Commit a `models.lock` file (TOML) listing every weight file we expect on
+the volume. Initial contents:
 
-- HF repo + revision
-- filename
-- sha256
-- bytes
+```toml
+[[model]]
+kind     = "diffusion_models"
+repo     = "Comfy-Org/Qwen-Image_ComfyUI"
+revision = "main"                          # pin to a commit SHA before go-live
+path     = "split_files/diffusion_models/qwen_image_2512_bf16.safetensors"
+dest     = "models/diffusion_models/qwen_image_2512_bf16.safetensors"
+bytes    = 40_900_000_000                  # ~40.9 GB, confirm on download
+sha256   = "TBD-on-first-download"
 
-The one-time populator script (`scripts/populate_volume.py`) reads this file,
-downloads each entry with `huggingface_hub.hf_hub_download`, verifies the
-hash, and places it under the correct `models/<kind>/` subdir. Same script
-runs as the fallback first-boot downloader in §2.
+[[model]]
+kind     = "text_encoders"
+repo     = "Comfy-Org/Qwen-Image_ComfyUI"
+revision = "main"
+path     = "split_files/text_encoders/qwen_2.5_vl_7b.safetensors"
+dest     = "models/text_encoders/qwen_2.5_vl_7b.safetensors"
+bytes    = 16_600_000_000                  # ~16.6 GB
+sha256   = "TBD-on-first-download"
 
-This is what makes "Qwen-Image 2512" reproducible — the version is the lock
-file, not a tag in our heads.
+[[model]]
+kind     = "vae"
+repo     = "Comfy-Org/Qwen-Image_ComfyUI"
+revision = "main"
+path     = "split_files/vae/qwen_image_vae.safetensors"
+dest     = "models/vae/qwen_image_vae.safetensors"
+bytes    = 254_000_000                     # ~254 MB
+sha256   = "TBD-on-first-download"
+
+[[model]]
+kind     = "loras"
+repo     = "lightx2v/Qwen-Image-2512-Lightning"
+revision = "main"
+path     = "Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors"
+dest     = "models/loras/Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors"
+bytes    = 0                               # fill on first download
+sha256   = "TBD-on-first-download"
+optional = true                            # only needed for the turbo variant
+```
+
+The one-time populator script (`scripts/populate_volume.py`) reads this
+file, downloads each entry with `huggingface_hub.hf_hub_download`, records
+the true size and sha256 on first run, writes them back into the lock file,
+and places the file under the correct `models/<kind>/` subdir. Subsequent
+runs verify rather than re-download. Same script runs as the fallback
+first-boot downloader in §2.
+
+**Before go-live:** replace every `revision = "main"` with the actual HF
+commit SHA you downloaded from, and every `TBD-on-first-download` with the
+real sha256. That's what makes "Qwen-Image 2512" reproducible — the version
+is the lock file, not a tag in our heads.
 
 ---
 
@@ -258,20 +326,29 @@ provider if we want it in code later):
 |---------------------|-----------------------------------------------------------------|
 | Container image     | `ghcr.io/<org>/comfyui-qwen-image:<sha>` (built in CI)          |
 | Container disk      | 20 GB (code + pip cache, no weights)                            |
-| GPU types           | `RTX 4090`, `L40S`, `A100 40GB` — prefer 24 GB+ for fp8        |
+| GPU types           | `H100 80GB`, `H200`, `A100 80GB` — **80 GB tier required**     |
 | Min workers         | 0                                                               |
 | Max workers         | 3 to start                                                      |
 | Idle timeout        | 5 s                                                             |
 | FlashBoot           | **on** — this is the big cold-start win                         |
-| Execution timeout   | 300 s                                                           |
+| Execution timeout   | 600 s (50-step jobs are slow on the quality variant)            |
 | Network Volume      | attach the volume created in §2 (same datacenter)               |
 | Env vars            | `COMFY_PORT=8188`, optional `BUCKET_*` for S3 output            |
 
-GPU sizing notes:
-- fp8 Qwen-Image fits on a 24 GB card with room for a reasonable batch.
-- fp16 wants 48 GB+; only worth it if quality regressions from fp8 show up.
-- Qwen 2.5-VL text encoder is ~8 GB on its own; don't try to run this on a
-  16 GB card.
+GPU sizing notes (this is the big change from a quantized setup):
+- **Full bf16 needs the 80 GB tier.** 40.9 GB UNet + 16.6 GB text encoder
+  + VAE + activations does not fit on a 48 GB card (L40S, A6000 Ada) at
+  full precision. Use `A100 80GB`, `H100 80GB`, or `H200`.
+- The 16.6 GB bf16 text encoder is not optional at full precision. If we
+  ever need to fit on 48 GB later, the drop is to swap the text encoder
+  to `qwen_2.5_vl_7b_fp8_scaled.safetensors` (9.38 GB) — that single swap
+  makes the stack fit without touching the UNet precision. Note that as a
+  separate, explicit fallback, not a silent downgrade.
+- `--lowvram` / CPU offload of the text encoder is a valid emergency
+  pressure-release valve but tanks per-job latency; avoid as default.
+- Cold start budget: expect 60–120 s the first time a worker pulls
+  57.8 GB of weights across the volume into GPU memory. FlashBoot helps
+  with container state but not with first-touch model loading.
 
 ---
 
@@ -333,14 +410,33 @@ GPU sizing notes:
 
 ## 11. Open questions to resolve before implementation
 
-1. **Exact 2512 filenames + hashes.** Pull from `Comfy-Org/Qwen-Image_ComfyUI`
-   (or the official Qwen release) and pin in `models.lock`.
-2. **Datacenter.** Which RunPod DC has the best mix of 24 GB+ availability
-   and latency for our callers?
-3. **Output transport.** Inline base64 (simple, bigger payloads) vs S3/R2
-   presigned URLs (needs a bucket). Default to base64 for v1 unless a caller
-   needs otherwise.
-4. **ComfyUI pin.** Pick a specific ComfyUI commit that has stable 2512
-   support and set `COMFYUI_REF` to it — don't float on `master`.
-5. **Lightning LoRA licence.** Confirm the Lightning LoRA's licence is
-   compatible with our usage before shipping the 8-step workflow as default.
+1. **Datacenter.** Which RunPod DC has the best mix of `H100 80GB` /
+   `A100 80GB` / `H200` availability and acceptable latency for our
+   callers? The Network Volume has to be created in that same DC.
+2. **Output transport.** Inline base64 (simple, bigger payloads) vs S3/R2
+   presigned URLs (needs a bucket). Default to base64 for v1 unless a
+   caller needs otherwise.
+3. **ComfyUI commit pin.** Pick a specific ComfyUI commit from
+   January 2026 or later that has stable 2512 support, set `COMFYUI_REF`
+   to its SHA, and record why that commit in CI notes.
+4. **HF revision pins.** On first volume hydration, capture the actual
+   commit SHAs for `Comfy-Org/Qwen-Image_ComfyUI` and
+   `lightx2v/Qwen-Image-2512-Lightning` and write them into `models.lock`
+   (replacing `"main"`).
+
+### Resolved (from research on 2026-04-15)
+
+- ~~Exact 2512 filenames + hashes~~ — see §6.
+- ~~Lightning LoRA licence~~ — Apache-2.0, OK to ship.
+- ~~Does 2512 introduce new ComfyUI node types~~ — no, it's a drop-in
+  weight swap on the original Qwen-Image graph.
+
+## 12. References
+
+- Model: https://huggingface.co/Qwen/Qwen-Image-2512
+- ComfyUI-packaged weights: https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI
+- Reference workflow: https://github.com/Comfy-Org/workflow_templates/blob/main/templates/image_qwen_Image_2512.json
+- Lightning LoRA: https://huggingface.co/lightx2v/Qwen-Image-2512-Lightning
+- ComfyUI tutorial: https://docs.comfy.org/tutorials/image/qwen/qwen-image-2512
+- Qwen blog post: https://qwen.ai/blog?id=qwen-image-2512
+- Worker handler reference: https://github.com/runpod-workers/worker-comfyui
