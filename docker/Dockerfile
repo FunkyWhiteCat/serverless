@@ -11,7 +11,14 @@
 # which leaves ~30–40 % of steady-state throughput on the table.
 # Staying on ubuntu22.04 keeps Python at 3.10 so ComfyUI's
 # requirements.txt doesn't need re-validation against 3.12.
-FROM nvidia/cuda:13.0.2-cudnn-runtime-ubuntu22.04
+#
+# Using the -devel- variant (not -runtime-) because we need nvcc +
+# CUDA headers at build time to compile sageattention from source —
+# no pre-built wheel for the torch 2.11 / cu130 combo exists on PyPI
+# yet. Image size is ~3 GB larger than runtime; acceptable for a
+# serverless worker where the image is pulled once per physical host
+# and then reused across warm invocations.
+FROM nvidia/cuda:13.0.2-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -26,6 +33,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         python3 \
         python3-pip \
+        python3-dev \
+        build-essential \
         ffmpeg \
         libgl1 \
         libglib2.0-0 \
@@ -48,13 +57,23 @@ RUN git clone https://github.com/comfyanonymous/ComfyUI /opt/ComfyUI \
 # to a cu130 build, and PyPI is added as a fallback index so the
 # cuda-bindings transitive dep (which is missing from whl/cu130; see
 # pytorch/pytorch#172926) can still be found.
+#
+# sageattention is installed *after* torch so its setup.py can detect
+# the already-installed torch version. ComfyUI's --use-sage-attention
+# flag (wired in start.sh) will route the Qwen-Image UNet attention
+# through sage's fused fp8/bf16 kernels — on H200 this typically
+# shaves another 10–20 % off each KSampler step vs. plain pytorch
+# SDPA. --no-build-isolation lets the source build (if pip falls
+# through to one) reuse the system torch instead of pulling a
+# fresh CPU-only wheel into an isolated env.
 RUN pip install --upgrade pip \
     && pip install \
         --index-url https://download.pytorch.org/whl/cu130 \
         --extra-index-url https://pypi.org/simple \
         torch torchvision torchaudio \
     && pip install -r /opt/ComfyUI/requirements.txt \
-    && pip install runpod websocket-client
+    && pip install runpod websocket-client \
+    && pip install --no-build-isolation sageattention
 
 # ComfyUI reads extra_model_paths.yaml from its own directory on startup.
 COPY docker/extra_model_paths.yaml /opt/ComfyUI/extra_model_paths.yaml
