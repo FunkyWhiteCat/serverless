@@ -25,21 +25,20 @@ mkdir -p "${VOLUME_ROOT}/input" \
          "${VOLUME_ROOT}/models/controlnet" \
          "${VOLUME_ROOT}/models/upscale_models"
 
-# Symlink ComfyUI's own input/output/temp dirs onto the volume so files
-# uploaded by the handler are visible to ComfyUI and outputs survive
-# across jobs.
-ln -sfn "${VOLUME_ROOT}/input"  /opt/ComfyUI/input
-ln -sfn "${VOLUME_ROOT}/output" /opt/ComfyUI/output
-ln -sfn "${VOLUME_ROOT}/temp"   /opt/ComfyUI/temp
-
-# Start ComfyUI in the background, bound to localhost only. --disable-
-# metadata strips embedded prompt/workflow from saved PNGs so we don't
-# leak internal node graphs in outputs.
+# Tell ComfyUI to use the volume for input/output/temp directly via its
+# own CLI flags, instead of symlinking /opt/ComfyUI/{input,output,temp}
+# onto the volume. ComfyUI's git clone already ships a real /opt/ComfyUI/
+# output directory, so `ln -sfn` would silently create the link INSIDE
+# it instead of replacing it, and SaveImage would write to container-
+# local disk where the handler can't reach it.
 python3 /opt/ComfyUI/main.py \
     --listen "${COMFY_HOST}" \
     --port "${COMFY_PORT}" \
     --disable-auto-launch \
-    --disable-metadata &
+    --disable-metadata \
+    --output-directory "${VOLUME_ROOT}/output" \
+    --input-directory  "${VOLUME_ROOT}/input" \
+    --temp-directory   "${VOLUME_ROOT}/temp" &
 
 # The handler blocks on runpod.serverless.start(...) so this never returns.
 exec python3 -u /app/src/handler.py
