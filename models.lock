@@ -14,8 +14,8 @@ repo     = "Comfy-Org/Qwen-Image_ComfyUI"
 revision = "main"
 path     = "split_files/diffusion_models/qwen_image_2512_bf16.safetensors"
 dest     = "models/diffusion_models/qwen_image_2512_bf16.safetensors"
-bytes    = 0
-sha256   = "TBD-on-first-download"
+bytes    = 40861031488
+sha256   = "cbf55390fff27dbc785046d7007b04e0c5dd7421e7ef128f2831eacb53a8e075"
 
 [[model]]
 kind     = "text_encoders"
@@ -23,8 +23,8 @@ repo     = "Comfy-Org/Qwen-Image_ComfyUI"
 revision = "main"
 path     = "split_files/text_encoders/qwen_2.5_vl_7b.safetensors"
 dest     = "models/text_encoders/qwen_2.5_vl_7b.safetensors"
-bytes    = 0
-sha256   = "TBD-on-first-download"
+bytes    = 16584415576
+sha256   = "cfafd739459bc86257397259f612a9aee88e5b98e85b5c0d0d1717e898b3463a"
 
 [[model]]
 kind     = "vae"
@@ -32,5 +32,5 @@ repo     = "Comfy-Org/Qwen-Image_ComfyUI"
 revision = "main"
 path     = "split_files/vae/qwen_image_vae.safetensors"
 dest     = "models/vae/qwen_image_vae.safetensors"
-bytes    = 0
-sha256   = "TBD-on-first-download"
+bytes    = 253806246
+sha256   = "a70580f0213e67967ee9c95f05bb400e8fb08307e017a924bf3441223e023d1f"
