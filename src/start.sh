@@ -31,11 +31,20 @@ mkdir -p "${VOLUME_ROOT}/input" \
 # output directory, so `ln -sfn` would silently create the link INSIDE
 # it instead of replacing it, and SaveImage would write to container-
 # local disk where the handler can't reach it.
+#
+# --use-sage-attention routes the UNet / text-encoder attention through
+# the sageattention package's fused fp8/bf16 kernels. On H200 this
+# replaces ComfyUI's default "Using pytorch attention" (plain
+# F.scaled_dot_product_attention) and typically takes another 10–20 %
+# off each KSampler step for Qwen-Image 2512. The sageattention wheel
+# is installed in the Docker image; ComfyUI will log
+# "Using sage attention" on startup if it loaded successfully.
 python3 /opt/ComfyUI/main.py \
     --listen "${COMFY_HOST}" \
     --port "${COMFY_PORT}" \
     --disable-auto-launch \
     --disable-metadata \
+    --use-sage-attention \
     --output-directory "${VOLUME_ROOT}/output" \
     --input-directory  "${VOLUME_ROOT}/input" \
     --temp-directory   "${VOLUME_ROOT}/temp" &
