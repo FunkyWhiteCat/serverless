@@ -234,7 +234,7 @@ Node graph (from the reference template, all stock ComfyUI nodes — the
 4. `ModelSamplingAuraFlow` → **shift = 3.1** (tuned for 2512; original
    Qwen-Image used ~3.0 — do not inherit shift from an old workflow)
 5. `CLIPTextEncode` × 2 (positive / negative)
-6. `EmptySD3LatentImage` → **1328 × 1328** (native 1:1 resolution)
+6. `EmptySD3LatentImage` → **1104 × 1472** (portrait 3:4; see table below)
 7. `KSampler` — sampler `euler`, scheduler `simple`
 8. `VAEDecode` → `SaveImage`
 
@@ -247,7 +247,26 @@ Node graph (from the reference template, all stock ComfyUI nodes — the
 | Sampler   | `euler` |
 | Scheduler | `simple` |
 | Shift     | **3.1** (`ModelSamplingAuraFlow`) |
-| Resolution | 1328 × 1328 default |
+| Resolution | **1104 × 1472** (portrait 3:4) |
+
+### Supported resolutions (Qwen's official `aspect_ratios` dict)
+
+All seven entries sit at ~1.76 MP, the model's native training resolution.
+Callers can override `width` / `height` via the `EmptySD3LatentImage` node,
+but should only ever use values from this list:
+
+| Aspect | Width × Height |
+|--------|----------------|
+| 1:1    | 1328 × 1328 |
+| 16:9   | 1664 × 928  |
+| 9:16   | 928 × 1664  |
+| 4:3    | 1472 × 1104 |
+| **3:4**  | **1104 × 1472** *(default)* |
+| 3:2    | 1584 × 1056 |
+| 2:3    | 1056 × 1584 |
+
+Source: [`QwenLM/Qwen-Image` README](https://github.com/QwenLM/Qwen-Image/blob/main/README.md),
+same list applies to Qwen-Image 2512.
 
 These are the upstream defaults from the 2512 template. Don't touch them
 without a concrete quality complaint to fix. Upstream guidance: if text
@@ -331,21 +350,30 @@ different DC — there is no cross-DC mounting.
 
 ### 7b. Endpoint settings
 
-Create the Serverless endpoint via the RunPod web console (or Terraform
-provider if we want it in code later):
+Create the Serverless endpoint via the RunPod web console. **No external
+container registry.** RunPod's Serverless GitHub integration builds the
+Dockerfile directly from this repo on every push to the target branch —
+zero CI on our side, no GHCR/DockerHub, no image tag management.
 
-| Setting             | Value                                                           |
-|---------------------|-----------------------------------------------------------------|
-| Container image     | `ghcr.io/<org>/comfyui-qwen-image:<sha>` (built in CI)          |
-| Container disk      | 20 GB (code + pip cache, no weights)                            |
-| GPU types           | `H100 80GB`, `H200`, `A100 80GB` — **80 GB tier required**     |
-| Min workers         | 0                                                               |
-| Max workers         | 3 to start                                                      |
-| Idle timeout        | 5 s                                                             |
-| FlashBoot           | **on** — this is the big cold-start win                         |
-| Execution timeout   | 600 s (50-step jobs are slow on the quality variant)            |
-| Network Volume      | attach the volume created in §2 (same datacenter)               |
-| Env vars            | `COMFY_PORT=8188`, optional `BUCKET_*` for S3 output            |
+| Setting             | Value                                                                         |
+|---------------------|-------------------------------------------------------------------------------|
+| Build source        | **GitHub: `FunkyWhiteCat/serverless`, branch `<release>`, Dockerfile `docker/Dockerfile`** |
+| Container disk      | 20 GB (code + pip cache, no weights)                                          |
+| GPU types (priority)| `H200` → `H100 80GB SXM` → `H100 80GB PCIe` → `A100 80GB SXM` → `A100 80GB PCIe` |
+| Min workers         | 0                                                                             |
+| Max workers         | 3 to start                                                                    |
+| Idle timeout        | 5 s                                                                           |
+| FlashBoot           | **on** — cold-start win                                                       |
+| Execution timeout   | 600 s (50-step jobs run long)                                                 |
+| Network Volume      | attach the `US-GA-2` volume from §7a                                          |
+| Env vars            | `COMFY_PORT=8188`                                                             |
+
+**GPU selection policy.** RunPod Serverless lets you give a multi-select
+GPU list; the platform picks an available worker from that list per job.
+Listing them in descending-speed order (H200 first, A100 PCIe last) means
+the fastest available card is always tried first. If H200s are saturated
+in US-GA-2, jobs fall through to H100s, then A100s — no caller-facing
+config needed.
 
 GPU sizing notes (this is the big change from a quantized setup):
 - **Full bf16 needs the 80 GB tier.** 40.9 GB UNet + 16.6 GB text encoder
@@ -369,6 +397,7 @@ GPU sizing notes (this is the big change from a quantized setup):
 ```
 .
 ├── PLAN.md                         (this file)
+├── models.lock                     (HF pins for Qwen-Image 2512)
 ├── docker/
 │   ├── Dockerfile
 │   └── extra_model_paths.yaml
@@ -378,31 +407,72 @@ GPU sizing notes (this is the big change from a quantized setup):
 │   └── workflows.py
 ├── workflows/
 │   └── qwen_image_2512_t2i.json
-├── scripts/
-│   ├── populate_volume.py          # one-shot volume hydrator
-│   └── smoke_test.py               # hits /runsync with a tiny prompt
-├── models.lock
-└── .github/workflows/
-    └── build-and-push.yml          # GHCR build on tag
+└── scripts/
+    ├── populate_volume.py          # one-shot volume hydrator
+    └── smoke_test.py               # hits /runsync with a tiny prompt
 ```
+
+No `.github/workflows/` — RunPod's Serverless GitHub integration builds
+the image on their side, so we don't need a CI workflow or an external
+registry.
 
 ---
 
 ## 9. Build → deploy → verify loop
 
-1. **Build.** `docker buildx build --platform linux/amd64 -t ghcr.io/<org>/comfyui-qwen-image:$(git rev-parse --short HEAD) .` and push.
-   CI does this on tag so the image digest is pinned.
-2. **Hydrate the volume** (first time only, or when `models.lock` changes):
-   rent a cheap pod in the target DC with the volume attached, run
-   `python scripts/populate_volume.py --lock models.lock`, terminate the pod.
-3. **Update endpoint** to point at the new image tag. FlashBoot warms it.
+1. **Hydrate the volume** (one-time, or when `models.lock` changes):
+   rent a cheap pod in `US-GA-2` with the volume attached and run
+   `python scripts/populate_volume.py`. Step-by-step in §9a. Terminate
+   the pod when the script finishes.
+2. **Push code.** Commit handler + Dockerfile + workflow JSON to the
+   release branch. RunPod's GitHub integration picks it up and rebuilds
+   the worker image automatically.
+3. **Wait for build.** Watch the build log in the RunPod Serverless UI.
+   First build is ~5 min; incremental builds after that are faster.
 4. **Smoke test.** `python scripts/smoke_test.py --endpoint <id> --api-key $RP_KEY`
-   POSTs a tiny 512×512 prompt and asserts we get ≥1 image back.
-5. **Benchmark.** Record cold-start + warm `/runsync` latency and per-
-   job wall time for the 50-step quality workflow at 1328×1328.
-6. **Monitor.** RunPod dashboard for worker count, failures, GPU util; send
-   handler errors (with `prompt_id`) to whatever logging stack we standardise
-   on — stdout is fine for v1.
+   POSTs a short prompt at 1104×1472 and asserts we get ≥1 image back.
+5. **Benchmark.** Record cold-start + warm `/runsync` wall time for the
+   50-step quality workflow at 1104×1472.
+6. **Monitor.** RunPod dashboard for worker count, failures, GPU util;
+   handler errors (with `prompt_id`) go to stdout for v1.
+
+### 9a. One-time volume hydration (step by step)
+
+This runs the `scripts/populate_volume.py` script once, from inside a
+throwaway RunPod pod that has the `US-GA-2` Network Volume attached. The
+volume keeps the downloaded weights after the pod is terminated.
+
+1. **Rent a throwaway pod in US-GA-2.** RunPod web console →
+   **Pods → Deploy**. Filter by datacenter `US-GA-2`. Pick **the cheapest
+   GPU available** (e.g. `RTX 2000 Ada` or `RTX A4000` — we only need
+   network I/O, not compute). In the deploy dialog:
+   - **Network Volume:** attach the US-GA-2 volume.
+   - **Container image:** `runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04`
+     (or any recent PyTorch image; we just need Python 3.11 + pip).
+   - **Container disk:** 20 GB is fine.
+   - **Expose HTTP ports:** none needed.
+2. **Open a web terminal** on the pod from the RunPod UI (or SSH in).
+3. Run the hydration script:
+   ```bash
+   cd /workspace
+   git clone https://github.com/FunkyWhiteCat/serverless.git
+   cd serverless
+   pip install "huggingface_hub>=0.26" hf_transfer
+   HF_HUB_ENABLE_HF_TRANSFER=1 python scripts/populate_volume.py
+   ```
+   Expect ~58 GB of downloads. At typical RunPod egress (500 MB/s–1 GB/s
+   from HF with `hf_transfer` on) this takes roughly 1–3 minutes.
+4. **Copy the sha256/bytes values** the script prints at the end, paste
+   them into `models.lock` to replace the `TBD-on-first-download` lines,
+   and commit + push.
+5. **Verify** the files are in place:
+   ```bash
+   ls -lh /runpod-volume/ComfyUI/models/diffusion_models/
+   ls -lh /runpod-volume/ComfyUI/models/text_encoders/
+   ls -lh /runpod-volume/ComfyUI/models/vae/
+   ```
+6. **Terminate the pod** from the RunPod UI. The volume (and its files)
+   persist; only the compute goes away.
 
 ---
 
@@ -421,28 +491,25 @@ GPU sizing notes (this is the big change from a quantized setup):
 
 ## 11. Open questions to resolve before implementation
 
-1. **Datacenter.** Which RunPod DC has the best mix of `H100 80GB` /
-   `A100 80GB` / `H200` availability and acceptable latency for our
-   callers? The Network Volume has to be created in that same DC.
-   Decision procedure is in §7a — pick via the web console when you go
-   to create the volume. Record the choice in `.env.infra`.
-2. **Output transport.** Inline base64 (simple, bigger payloads) vs S3/R2
-   presigned URLs (needs a bucket). Default to base64 for v1 unless a
-   caller needs otherwise.
-3. **ComfyUI commit pin.** Pick a specific ComfyUI commit from
+1. **ComfyUI commit pin.** Pick a specific ComfyUI commit from
    January 2026 or later that has stable 2512 support, set `COMFYUI_REF`
    to its SHA, and record why that commit in CI notes.
-4. **HF revision pins.** On first volume hydration, capture the actual
+2. **HF revision pins.** On first volume hydration, capture the actual
    commit SHA for `Comfy-Org/Qwen-Image_ComfyUI` and write it into
    `models.lock` (replacing `"main"`).
 
-### Resolved (from research on 2026-04-15)
+### Resolved
 
 - ~~Exact 2512 filenames + hashes~~ — see §6.
-- ~~Does 2512 introduce new ComfyUI node types~~ — no, it's a drop-in
-  weight swap on the original Qwen-Image graph.
-- ~~Should we ship a Lightning turbo variant~~ — no. Quality-first
-  endpoint, 50 steps full bf16, no LoRAs.
+- ~~Does 2512 introduce new ComfyUI node types~~ — no, drop-in weight swap.
+- ~~Should we ship a Lightning turbo variant~~ — no. Quality-first.
+- ~~Datacenter~~ — `US-GA-2` (§7a). Volume provisioned.
+- ~~Container registry~~ — none. RunPod's GitHub integration builds
+  directly from this repo (§7b / §9).
+- ~~Output transport~~ — inline base64 in the JSON response.
+- ~~Default resolution~~ — 1104×1472 portrait (Qwen official 3:4).
+- ~~GPU selection~~ — fastest-first list, H200 → H100 SXM → H100 PCIe →
+  A100 SXM → A100 PCIe. RunPod picks first available.
 
 ## 12. References
 

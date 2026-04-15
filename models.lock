@@ -1,0 +1,36 @@
+# models.lock
+#
+# Pin Qwen-Image 2512 full-bf16 model files to specific Hugging Face
+# revisions. `scripts/populate_volume.py` reads this file to hydrate the
+# RunPod Network Volume mounted at /runpod-volume.
+#
+# On first hydration, replace every TBD-on-first-download sha256 with the
+# value printed by the populate script, set `bytes` to the real size, and
+# consider pinning `revision` to a commit SHA instead of "main".
+
+[[model]]
+kind     = "diffusion_models"
+repo     = "Comfy-Org/Qwen-Image_ComfyUI"
+revision = "main"
+path     = "split_files/diffusion_models/qwen_image_2512_bf16.safetensors"
+dest     = "models/diffusion_models/qwen_image_2512_bf16.safetensors"
+bytes    = 0
+sha256   = "TBD-on-first-download"
+
+[[model]]
+kind     = "text_encoders"
+repo     = "Comfy-Org/Qwen-Image_ComfyUI"
+revision = "main"
+path     = "split_files/text_encoders/qwen_2.5_vl_7b.safetensors"
+dest     = "models/text_encoders/qwen_2.5_vl_7b.safetensors"
+bytes    = 0
+sha256   = "TBD-on-first-download"
+
+[[model]]
+kind     = "vae"
+repo     = "Comfy-Org/Qwen-Image_ComfyUI"
+revision = "main"
+path     = "split_files/vae/qwen_image_vae.safetensors"
+dest     = "models/vae/qwen_image_vae.safetensors"
+bytes    = 0
+sha256   = "TBD-on-first-download"
