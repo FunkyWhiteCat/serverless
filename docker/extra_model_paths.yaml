@@ -1,0 +1,16 @@
+# Tells ComfyUI to look for weights on the RunPod Network Volume mounted
+# at /runpod-volume instead of its default /opt/ComfyUI/models directory.
+# All paths below are relative to base_path.
+
+runpod_volume:
+  base_path: /runpod-volume/ComfyUI
+
+  checkpoints:       models/checkpoints
+  diffusion_models:  models/diffusion_models
+  text_encoders:     models/text_encoders
+  vae:               models/vae
+  loras:             models/loras
+  clip_vision:       models/clip_vision
+  controlnet:        models/controlnet
+  upscale_models:    models/upscale_models
+  custom_nodes:      custom_nodes

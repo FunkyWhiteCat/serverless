@@ -1,0 +1,16 @@
+.git
+.github
+.claude
+.gitignore
+.dockerignore
+.env
+.env.*
+PLAN.md
+README.md
+*.md
+models.lock
+scripts/
+__pycache__/
+*.pyc
+smoke_test_output.png
+*.log

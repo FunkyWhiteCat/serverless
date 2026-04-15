@@ -1,0 +1,18 @@
+# Credentials — never commit these.
+.env
+.env.*
+*.key
+*.pem
+credentials.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+
+# Local test output
+smoke_test_output.png
+*.log
