@@ -310,32 +310,24 @@ is the lock file, not a tag in our heads.
 
 ## 7. RunPod endpoint configuration
 
-### 7a. Picking a datacenter (do this first)
+### 7a. Datacenter
 
-RunPod ("DC" = datacenter) runs GPU capacity in several physical regions
-(e.g. `EU-RO-1`, `US-KS-2`, `EU-CZ-1`, `CA-MTL-1`, and others — the set
-grows over time). Two constraints make the choice matter:
+**Chosen DC: `US-GA-2`** (Georgia, US). A 100 GB Network Volume has been
+provisioned here. The Serverless endpoint will auto-pin to `US-GA-2` when
+it attaches the volume.
 
-1. **Network Volumes are region-locked.** A Serverless endpoint can only
-   attach a volume that lives in the **same DC**. No cross-DC mounting,
-   no replication. Pick wrong and the fix is delete + recreate.
-2. **80 GB GPU availability varies per DC.** We need `H100 80GB`,
-   `A100 80GB`, or `H200`, and not every DC stocks all three at all times.
+Pre-flight check before building the endpoint: open **Serverless → GPU
+types** in the RunPod web console and confirm at least one of `H100 80GB`,
+`A100 80GB` or `H200` is listed as available in `US-GA-2`. If none of the
+80 GB tier SKUs is available there, the volume has to be recreated in a
+different DC — there is no cross-DC mounting.
 
-Decision procedure (one-time, in the RunPod web console):
-
-1. **Storage → Network Volumes → New Network Volume** — the dropdown lists
-   DCs that currently have capacity.
-2. Cross-reference against **Serverless → GPU types** for each candidate
-   DC and confirm at least one of H100 80GB / A100 80GB / H200 is listed.
-3. Prefer DCs that are geographically close to your primary callers.
-4. Create the 100 GB volume in the chosen DC. Record the DC name in a
-   `.env.infra` file in this repo so future work knows which region the
-   endpoint is pinned to.
-
-Once the volume exists, the Serverless endpoint auto-pins to that DC the
-moment it attaches the volume — no separate region picker on the endpoint
-side.
+> RunPod ("DC" = datacenter) runs GPU capacity in several physical
+> regions. Two constraints drive the choice: Network Volumes are
+> region-locked (endpoint must be in the same DC as the volume), and
+> 80 GB GPU availability varies per DC. The choice was made by looking at
+> **Storage → Network Volumes → New Network Volume** and picking a DC
+> that had both volume capacity and the 80 GB GPU tier.
 
 ### 7b. Endpoint settings
 
