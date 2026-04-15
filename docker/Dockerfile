@@ -3,7 +3,15 @@
 # Worker image for Serverless ComfyUI + Qwen-Image 2512.
 # Model weights live on a RunPod Network Volume at /runpod-volume —
 # they are NOT baked into this image.
-FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+#
+# CUDA 13 is required for Blackwell-generation GPUs (B200 / GB200,
+# compute capability sm_100). On cu124 PyTorch, ComfyUI prints
+# "You need pytorch with cu130 or higher to use optimized CUDA
+# operations." and silently falls back to PTX/JIT-compiled kernels,
+# which leaves ~30–40 % of steady-state throughput on the table.
+# Staying on ubuntu22.04 keeps Python at 3.10 so ComfyUI's
+# requirements.txt doesn't need re-validation against 3.12.
+FROM nvidia/cuda:13.0.2-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -32,11 +40,18 @@ RUN git clone https://github.com/comfyanonymous/ComfyUI /opt/ComfyUI \
     && cd /opt/ComfyUI \
     && git checkout ${COMFYUI_REF}
 
-# Install PyTorch for CUDA 12.4 first so ComfyUI's requirements don't
+# Install PyTorch for CUDA 13.0 first so ComfyUI's requirements don't
 # pull a default CPU/CUDA-mismatched wheel, then the rest of its deps,
 # then the handler-only packages.
+#
+# The PyTorch cu130 index is set as the primary so `torch` resolves
+# to a cu130 build, and PyPI is added as a fallback index so the
+# cuda-bindings transitive dep (which is missing from whl/cu130; see
+# pytorch/pytorch#172926) can still be found.
 RUN pip install --upgrade pip \
-    && pip install --index-url https://download.pytorch.org/whl/cu124 \
+    && pip install \
+        --index-url https://download.pytorch.org/whl/cu130 \
+        --extra-index-url https://pypi.org/simple \
         torch torchvision torchaudio \
     && pip install -r /opt/ComfyUI/requirements.txt \
     && pip install runpod websocket-client
