@@ -39,6 +39,7 @@ TEMP_DIR = VOLUME_ROOT / "temp"
 
 STARTUP_TIMEOUT_S = 240  # generous — ComfyUI on a cold worker is slow
 POLL_INTERVAL_S = 0.5
+WS_RECV_TIMEOUT_S = 300  # per-recv ceiling; covers first-mmap gaps
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +208,13 @@ def handler(event: dict) -> dict:
     client_id = str(uuid.uuid4())
     ws = websocket.WebSocket()
     ws.connect(f"{COMFY_WS}?clientId={client_id}", timeout=10)
+    # websocket-client applies `timeout` to every subsequent recv(). On a
+    # cold worker ComfyUI goes quiet on the ws while it mmaps ~57 GB of
+    # bf16 weights off the Network Volume — that gap can be 30–120 s
+    # before the first progress frame arrives. Bump the per-recv timeout
+    # well above that; RunPod's endpoint-level execution_timeout is the
+    # real ceiling and will kill a genuinely stuck job.
+    ws.settimeout(WS_RECV_TIMEOUT_S)
 
     t0 = time.monotonic()
     try:
