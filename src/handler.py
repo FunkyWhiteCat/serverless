@@ -39,7 +39,9 @@ TEMP_DIR = VOLUME_ROOT / "temp"
 
 STARTUP_TIMEOUT_S = 240  # generous — ComfyUI on a cold worker is slow
 POLL_INTERVAL_S = 0.5
-WS_RECV_TIMEOUT_S = 300  # per-recv ceiling; covers first-mmap gaps
+WS_RECV_TIMEOUT_S = 600  # per-recv ceiling; matches endpoint execution_timeout
+WARMUP_TIMEOUT_S = 900   # upper bound on first-time model load via /history
+WARMUP_POLL_INTERVAL_S = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +129,85 @@ def wait_for_completion(ws: "websocket.WebSocket", prompt_id: str) -> None:
 def fetch_history(prompt_id: str) -> dict:
     with urllib.request.urlopen(f"{COMFY_HTTP}/history/{prompt_id}") as r:
         return json.loads(r.read())
+
+
+# ---------------------------------------------------------------------------
+# Worker warmup (runs once at startup, before the handler is registered)
+# ---------------------------------------------------------------------------
+
+def _fetch_history_entry_or_none(prompt_id: str) -> dict | None:
+    """Non-raising variant of fetch_history for use inside warmup polling."""
+    try:
+        with urllib.request.urlopen(
+            f"{COMFY_HTTP}/history/{prompt_id}", timeout=10
+        ) as r:
+            history = json.loads(r.read())
+    except Exception:  # noqa: BLE001 — transient HTTP failures retry
+        return None
+    return history.get(prompt_id)
+
+
+def warmup() -> None:
+    """Force ComfyUI to fault in all ~58 GB of Qwen-Image 2512 weights
+    before we register the real handler with RunPod.
+
+    Submits a throwaway 1-step version of the default workflow and polls
+    ``/history`` to completion via plain HTTP (no websocket — we don't
+    want the handler's per-recv timeout to apply during the multi-minute
+    cold-load window). The work happens during worker initialization, so
+    it counts against RunPod's (generous) worker-init budget rather than
+    the per-job ``execution_timeout``.
+
+    After warmup, real jobs see a warm worker with models resident in
+    GPU memory, so the longest gap between websocket frames drops from
+    "whole UNet load time" to "sub-second inter-node transition" — well
+    within WS_RECV_TIMEOUT_S.
+    """
+    print(
+        "[handler] warming up: submitting a 1-step workflow to pre-load "
+        "Qwen-Image 2512 weights (may take several minutes on a cold "
+        "worker while ~58 GB is read off the network volume)...",
+        flush=True,
+    )
+    t0 = time.monotonic()
+
+    wf = wf_mod.load_default()
+    wf_mod.patch(
+        wf,
+        prompt="warmup",
+        negative_prompt="",
+        seed=0,
+        steps=1,
+        cfg=1.0,
+    )
+
+    client_id = "warmup-" + uuid.uuid4().hex
+    prompt_id = queue_prompt(wf, client_id)
+    print(f"[handler] warmup queued, prompt_id={prompt_id}", flush=True)
+
+    deadline = time.monotonic() + WARMUP_TIMEOUT_S
+    while time.monotonic() < deadline:
+        entry = _fetch_history_entry_or_none(prompt_id)
+        if entry is not None:
+            status_str = (entry.get("status") or {}).get("status_str")
+            if status_str == "success":
+                elapsed = time.monotonic() - t0
+                print(
+                    f"[handler] warmup completed in {elapsed:.1f}s; "
+                    f"worker is warm and ready",
+                    flush=True,
+                )
+                return
+            if status_str == "error":
+                raise RuntimeError(
+                    f"warmup errored: {json.dumps(entry.get('status'))}"
+                )
+        time.sleep(WARMUP_POLL_INTERVAL_S)
+
+    raise RuntimeError(
+        f"warmup did not finish within {WARMUP_TIMEOUT_S}s; "
+        f"worker is giving up"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -258,4 +339,5 @@ if __name__ == "__main__":
     print("[handler] waiting for ComfyUI to be ready...", flush=True)
     wait_for_comfy()
     print(f"[handler] ComfyUI ready at {COMFY_HTTP}", flush=True)
+    warmup()
     runpod.serverless.start({"handler": safe_handler})
