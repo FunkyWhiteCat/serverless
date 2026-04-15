@@ -64,10 +64,10 @@ Key choices:
 ## 2. Network Volume layout
 
 Full bf16 stack totals ~57.8 GB on disk (40.9 + 16.6 + 0.25). With headroom
-for the Lightning LoRA, ComfyUI custom nodes, input/output buffering and
-future variants, **provision the Network Volume at 150 GB**. Resizing later
-is possible but the volume has to be the same datacenter as the endpoint,
-so over-provision rather than under.
+for ComfyUI custom nodes, input/output buffering and future variants,
+**provision the Network Volume at 100 GB**. Resizing later is possible but
+the volume has to be the same datacenter as the endpoint, so over-provision
+rather than under.
 
 Mount path inside the worker: `/runpod-volume`.
 
@@ -76,27 +76,25 @@ Mount path inside the worker: `/runpod-volume`.
 └── ComfyUI/
     ├── models/
     │   ├── diffusion_models/
-    │   │   └── qwen_image_2512_bf16.safetensors              # 40.9 GB
+    │   │   └── qwen_image_2512_bf16.safetensors    # 40.9 GB
     │   ├── text_encoders/
-    │   │   └── qwen_2.5_vl_7b.safetensors                    # 16.6 GB, bf16
-    │   ├── vae/
-    │   │   └── qwen_image_vae.safetensors                    # 254 MB
-    │   └── loras/
-    │       └── Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors  # optional
+    │   │   └── qwen_2.5_vl_7b.safetensors          # 16.6 GB, bf16
+    │   └── vae/
+    │       └── qwen_image_vae.safetensors          # 254 MB
     ├── custom_nodes/
-    │   └── ComfyUI-Manager/                                  # optional
+    │   └── ComfyUI-Manager/                        # optional
     ├── input/
     └── output/
 ```
 
-All three core files come from the same repo:
+All three weight files come from the same repo:
 [`Comfy-Org/Qwen-Image_ComfyUI`](https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI)
 under `split_files/{diffusion_models,text_encoders,vae}/`.
 
-The Lightning LoRA comes from
-[`lightx2v/Qwen-Image-2512-Lightning`](https://huggingface.co/lightx2v/Qwen-Image-2512-Lightning)
-(Apache-2.0). **Must be the 2512-specific LoRA** — the older
-`lightx2v/Qwen-Image-Lightning` LoRA produces broken output on 2512 weights.
+**No LoRAs.** This endpoint is quality-first: no Lightning / turbo / step-
+distilled LoRAs. Jobs run the full 50-step schedule on the untouched bf16
+weights. If a "fast mode" is ever wanted, it's a separate endpoint with a
+separate workflow — not a flag on this one.
 
 ### How to populate the volume
 
@@ -240,22 +238,25 @@ Node graph (from the reference template, all stock ComfyUI nodes — the
 7. `KSampler` — sampler `euler`, scheduler `simple`
 8. `VAEDecode` → `SaveImage`
 
-### Two workflow variants to ship
+### Sampling parameters (quality-first, no turbo path)
 
-| Variant | Steps | CFG | LoRA | Notes |
-|---------|-------|-----|------|-------|
-| **Quality** (default) | 50 | 4.0 | none | Upstream default from the 2512 template. |
-| **Turbo** | 4  | 1.0 | Lightning 4-step bf16 | Stack `LoraLoader` between `UNETLoader` and `ModelSamplingAuraFlow`, strength 1.0. |
+| Param     | Value   |
+|-----------|---------|
+| Steps     | **50**  |
+| CFG       | **4.0** |
+| Sampler   | `euler` |
+| Scheduler | `simple` |
+| Shift     | **3.1** (`ModelSamplingAuraFlow`) |
+| Resolution | 1328 × 1328 default |
 
-Keep `cfg = 4.0` for the quality variant unless output regresses — upstream
-guidance is that if text rendering deforms, drop CFG before swapping the
-sampler.
+These are the upstream defaults from the 2512 template. Don't touch them
+without a concrete quality complaint to fix. Upstream guidance: if text
+rendering deforms, drop CFG before changing sampler.
 
 The workflow JSON is what clients POST in `input.workflow`; they override
-prompt text, seed, and size via node inputs. A small Python helper in
+prompt text, seed and size via node inputs. A small helper in
 `src/workflows.py` loads the JSON and patches those fields by node ID so
-callers don't have to know the graph shape. Two loader functions:
-`load_quality()` and `load_turbo()`.
+callers don't have to know the graph shape.
 
 ---
 
@@ -291,16 +292,6 @@ path     = "split_files/vae/qwen_image_vae.safetensors"
 dest     = "models/vae/qwen_image_vae.safetensors"
 bytes    = 254_000_000                     # ~254 MB
 sha256   = "TBD-on-first-download"
-
-[[model]]
-kind     = "loras"
-repo     = "lightx2v/Qwen-Image-2512-Lightning"
-revision = "main"
-path     = "Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors"
-dest     = "models/loras/Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors"
-bytes    = 0                               # fill on first download
-sha256   = "TBD-on-first-download"
-optional = true                            # only needed for the turbo variant
 ```
 
 The one-time populator script (`scripts/populate_volume.py`) reads this
@@ -318,6 +309,35 @@ is the lock file, not a tag in our heads.
 ---
 
 ## 7. RunPod endpoint configuration
+
+### 7a. Picking a datacenter (do this first)
+
+RunPod ("DC" = datacenter) runs GPU capacity in several physical regions
+(e.g. `EU-RO-1`, `US-KS-2`, `EU-CZ-1`, `CA-MTL-1`, and others — the set
+grows over time). Two constraints make the choice matter:
+
+1. **Network Volumes are region-locked.** A Serverless endpoint can only
+   attach a volume that lives in the **same DC**. No cross-DC mounting,
+   no replication. Pick wrong and the fix is delete + recreate.
+2. **80 GB GPU availability varies per DC.** We need `H100 80GB`,
+   `A100 80GB`, or `H200`, and not every DC stocks all three at all times.
+
+Decision procedure (one-time, in the RunPod web console):
+
+1. **Storage → Network Volumes → New Network Volume** — the dropdown lists
+   DCs that currently have capacity.
+2. Cross-reference against **Serverless → GPU types** for each candidate
+   DC and confirm at least one of H100 80GB / A100 80GB / H200 is listed.
+3. Prefer DCs that are geographically close to your primary callers.
+4. Create the 100 GB volume in the chosen DC. Record the DC name in a
+   `.env.infra` file in this repo so future work knows which region the
+   endpoint is pinned to.
+
+Once the volume exists, the Serverless endpoint auto-pins to that DC the
+moment it attaches the volume — no separate region picker on the endpoint
+side.
+
+### 7b. Endpoint settings
 
 Create the Serverless endpoint via the RunPod web console (or Terraform
 provider if we want it in code later):
@@ -365,8 +385,7 @@ GPU sizing notes (this is the big change from a quantized setup):
 │   ├── start.sh
 │   └── workflows.py
 ├── workflows/
-│   ├── qwen_image_2512_t2i.json
-│   └── qwen_image_2512_t2i_lightning.json
+│   └── qwen_image_2512_t2i.json
 ├── scripts/
 │   ├── populate_volume.py          # one-shot volume hydrator
 │   └── smoke_test.py               # hits /runsync with a tiny prompt
@@ -387,8 +406,8 @@ GPU sizing notes (this is the big change from a quantized setup):
 3. **Update endpoint** to point at the new image tag. FlashBoot warms it.
 4. **Smoke test.** `python scripts/smoke_test.py --endpoint <id> --api-key $RP_KEY`
    POSTs a tiny 512×512 prompt and asserts we get ≥1 image back.
-5. **Benchmark.** Record cold-start + warm `/runsync` latency and tokens-per-second-ish
-   throughput for the two workflow variants (20-step vs 8-step Lightning).
+5. **Benchmark.** Record cold-start + warm `/runsync` latency and per-
+   job wall time for the 50-step quality workflow at 1328×1328.
 6. **Monitor.** RunPod dashboard for worker count, failures, GPU util; send
    handler errors (with `prompt_id`) to whatever logging stack we standardise
    on — stdout is fine for v1.
@@ -413,6 +432,8 @@ GPU sizing notes (this is the big change from a quantized setup):
 1. **Datacenter.** Which RunPod DC has the best mix of `H100 80GB` /
    `A100 80GB` / `H200` availability and acceptable latency for our
    callers? The Network Volume has to be created in that same DC.
+   Decision procedure is in §7a — pick via the web console when you go
+   to create the volume. Record the choice in `.env.infra`.
 2. **Output transport.** Inline base64 (simple, bigger payloads) vs S3/R2
    presigned URLs (needs a bucket). Default to base64 for v1 unless a
    caller needs otherwise.
@@ -420,23 +441,22 @@ GPU sizing notes (this is the big change from a quantized setup):
    January 2026 or later that has stable 2512 support, set `COMFYUI_REF`
    to its SHA, and record why that commit in CI notes.
 4. **HF revision pins.** On first volume hydration, capture the actual
-   commit SHAs for `Comfy-Org/Qwen-Image_ComfyUI` and
-   `lightx2v/Qwen-Image-2512-Lightning` and write them into `models.lock`
-   (replacing `"main"`).
+   commit SHA for `Comfy-Org/Qwen-Image_ComfyUI` and write it into
+   `models.lock` (replacing `"main"`).
 
 ### Resolved (from research on 2026-04-15)
 
 - ~~Exact 2512 filenames + hashes~~ — see §6.
-- ~~Lightning LoRA licence~~ — Apache-2.0, OK to ship.
 - ~~Does 2512 introduce new ComfyUI node types~~ — no, it's a drop-in
   weight swap on the original Qwen-Image graph.
+- ~~Should we ship a Lightning turbo variant~~ — no. Quality-first
+  endpoint, 50 steps full bf16, no LoRAs.
 
 ## 12. References
 
 - Model: https://huggingface.co/Qwen/Qwen-Image-2512
 - ComfyUI-packaged weights: https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI
 - Reference workflow: https://github.com/Comfy-Org/workflow_templates/blob/main/templates/image_qwen_Image_2512.json
-- Lightning LoRA: https://huggingface.co/lightx2v/Qwen-Image-2512-Lightning
 - ComfyUI tutorial: https://docs.comfy.org/tutorials/image/qwen/qwen-image-2512
 - Qwen blog post: https://qwen.ai/blog?id=qwen-image-2512
 - Worker handler reference: https://github.com/runpod-workers/worker-comfyui
